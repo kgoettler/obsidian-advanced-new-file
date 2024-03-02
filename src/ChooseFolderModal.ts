@@ -1,8 +1,9 @@
-import { App, FuzzySuggestModal, TFolder, Vault, MarkdownView, TFile } from 'obsidian';
+import { App, normalizePath, FuzzySuggestModal, Platform, TFolder, Vault, MarkdownView, Notice, TFile } from 'obsidian';
 import CreateNoteModal from './CreateNoteModal';
 import { NewFileLocation } from './enums';
+import { path } from './utils';
 
-const EMPTY_TEXT = 'No folder found. Press esc to dismiss.';
+const EMPTY_TEXT = 'No existing folder found';
 const PLACEHOLDER_TEXT = 'Type folder name to fuzzy find.';
 const instructions = [
   { command: '↑↓', purpose: 'to navigate' },
@@ -18,7 +19,6 @@ export default class ChooseFolderModal extends FuzzySuggestModal<TFolder> {
   suggestionEmpty: HTMLDivElement;
   noSuggestion: boolean;
   newDirectoryPath: string;
-  createNoteModal: CreateNoteModal;
   inputListener: EventListener;
 
   constructor(app: App, mode: NewFileLocation) {
@@ -50,7 +50,6 @@ export default class ChooseFolderModal extends FuzzySuggestModal<TFolder> {
     this.setPlaceholder(PLACEHOLDER_TEXT);
     this.setInstructions(instructions);
     this.initChooseFolderItem();
-    this.createNoteModal = new CreateNoteModal(this.app, this.mode);
 
     this.inputListener = this.listenInput.bind(this);
   }
@@ -111,19 +110,77 @@ export default class ChooseFolderModal extends FuzzySuggestModal<TFolder> {
     super.onClose();
   }
 
-  onChooseItem(item: TFolder, evt: MouseEvent | KeyboardEvent): void {
-    if (this.noSuggestion) {
-      if (!this.shouldCreateFolder(evt)) {
-        return;
-      }
-      this.createNoteModal.setFolder(
-        this.app.vault.getRoot(),
-        this.newDirectoryPath
-      );
-    } else {
-      this.createNoteModal.setFolder(item, '');
+  onChooseItem(item: TFolder, evt: MouseEvent | KeyboardEvent) {
+    const itemDir = item.path;
+    const itemName = evt.target.value.replace(itemDir, "");
+    this.createNote(itemDir, itemName);
+  }
+
+  async createNote(dir : string, name : string) {
+    const dirExists = await this.app.vault.adapter.exists(dir);
+    if (!dirExists) {
+      await this.createDirectory(dir);
     }
-    this.createNoteModal.open();
+    const filePath = normalizePath(path.join(dir, `${name}.md`));
+    try {
+      const fileExists = await this.app.vault.adapter.exists(filePath);
+      if (fileExists) {
+        // If the file already exists, respond with error
+        throw new Error(`${filePath} already exists`);
+      }
+      const File = await this.app.vault.create(filePath, '');
+      // Create the file and open it in the active leaf
+      let leaf = this.app.workspace.getLeaf(false);
+      if (this.mode === NewFileLocation.NewPane) {
+        leaf = this.app.workspace.splitLeafOrActive();
+      } else if (this.mode === NewFileLocation.NewTab) {
+        leaf = this.app.workspace.getLeaf(true);
+      } else if (!leaf) {
+        // default for active pane
+        leaf = this.app.workspace.getLeaf(true);
+      }
+      await leaf.openFile(File);
+    } catch (error) {
+      new Notice(error.toString());
+    }
+  }
+
+  private async createDirectory(dir: string): Promise<void> {
+    const { vault } = this.app;
+    const { adapter } = vault;
+    const root = vault.getRoot().path;
+    const directoryExists = await adapter.exists(dir);
+    // ===============================================================
+    // -> Desktop App
+    // ===============================================================
+    if (!Platform.isIosApp) {
+      if (!directoryExists) {
+        return adapter.mkdir(normalizePath(dir));
+      }
+    }
+    // ===============================================================
+    // -> Mobile App (IOS)
+    // ===============================================================
+    // This is a workaround for a bug in the mobile app:
+    // To get the file explorer view to update correctly, we have to create
+    // each directory in the path one at time.
+
+    // Split the path into an array of sub paths
+    // Note: `normalizePath` converts path separators to '/' on all platforms
+    // @example '/one/two/three/' ==> ['one', 'one/two', 'one/two/three']
+    // @example 'one\two\three' ==> ['one', 'one/two', 'one/two/three']
+    const subPaths: string[] = normalizePath(dir)
+      .split('/')
+      .filter((part) => part.trim() !== '')
+      .map((_, index, arr) => arr.slice(0, index + 1).join('/'));
+
+    // Create each directory if it does not exist
+    for (const subPath of subPaths) {
+      const directoryExists = await adapter.exists(path.join(root, subPath));
+      if (!directoryExists) {
+        await adapter.mkdir(path.join(root, subPath));
+      }
+    }
   }
 
   initChooseFolderItem() {
@@ -135,6 +192,7 @@ export default class ChooseFolderModal extends FuzzySuggestModal<TFolder> {
   }
 
   itemInstructionMessage(resultEl: HTMLElement, message: string) {
+    resultEl.style.color = "var(--color-green)";
     const el = document.createElement('kbd');
     el.addClass('suggestion-hotkey');
     el.innerText = message;
